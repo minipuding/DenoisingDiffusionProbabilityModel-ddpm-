@@ -57,7 +57,7 @@ class GaussianDiffusionSampler(nn.Module):
         self.register_buffer('betas', torch.linspace(beta_1, beta_T, T).double())
         alphas = 1. - self.betas
         alphas_bar = torch.cumprod(alphas, dim=0)
-        alphas_bar_prev = F.pad(alphas_bar, [1, 0], value=1)[:T]
+        alphas_bar_prev = F.pad(alphas_bar, [1, 0], value=1)[:T]  # 把alpha_bar的第一个数字换成1,按序后移
 
         self.register_buffer('coeff1', torch.sqrt(1. / alphas))
         self.register_buffer('coeff2', self.coeff1 * (1. - alphas) / torch.sqrt(1. - alphas_bar))
