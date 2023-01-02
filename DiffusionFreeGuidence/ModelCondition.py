@@ -1,5 +1,3 @@
-
-   
 import math
 from telnetlib import PRAGMA_HEARTBEAT
 import torch
@@ -9,6 +7,9 @@ from torch.nn import functional as F
 
 
 def drop_connect(x, drop_ratio):
+    """
+    这个函数在整个Project中都没被用到, 暂时先不考虑它的功能
+    """
     keep_ratio = 1.0 - drop_ratio
     mask = torch.empty([x.shape[0], 1, 1, 1], dtype=x.dtype, device=x.device)
     mask.bernoulli_(p=keep_ratio)
@@ -16,12 +17,16 @@ def drop_connect(x, drop_ratio):
     x.mul_(mask)
     return x
 
+
 class Swish(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(x)
 
 
 class TimeEmbedding(nn.Module):
+    """
+    和``Diffusion.Model``中的``TimeEmbedding``一模一样
+    """
     def __init__(self, T, d_model, dim):
         assert d_model % 2 == 0
         super().__init__()
@@ -47,9 +52,17 @@ class TimeEmbedding(nn.Module):
 
 
 class ConditionalEmbedding(nn.Module):
+    """
+    这是一个条件编码模块，将condition编码为embedding
+    除了初始化Embedding不同，其他部分与time-embedding无异。
+    """
     def __init__(self, num_labels, d_model, dim):
         assert d_model % 2 == 0
         super().__init__()
+        # 注意，这里在初始化embedding时有一个细节——``num_embeddings=num_labels+1``也就是10+1=11
+        # 本实例中考虑的condition是CIFAR10的label，共10个类别，对应0~9，按理来说只需要10个embedding即可，
+        # 但是我们需要给``无条件``情况一个embedding表示，在本实例中就是用``0```来表示，
+        # 与此同时10个类别对应的标号分别加一，即1~10(会在``TrainCondition.py``中体现), 因此共需要11个embedding
         self.condEmbedding = nn.Sequential(
             nn.Embedding(num_embeddings=num_labels + 1, embedding_dim=d_model, padding_idx=0),
             nn.Linear(d_model, dim),
@@ -57,12 +70,18 @@ class ConditionalEmbedding(nn.Module):
             nn.Linear(dim, dim),
         )
 
-    def forward(self, t):
-        emb = self.condEmbedding(t)
-        return emb
+    def forward(self, labels):
+        cemb = self.condEmbedding(labels)
+        return cemb
 
 
 class DownSample(nn.Module):
+    """
+    相比于``Diffusion.Model.DownSample``, 这里的降采样模块多加了一个5x5、stride=2的conv层
+    前向过程由3x3和5x5卷积输出相加得来，不知为什么这么做，可能为了融合更多尺度的信息
+    查看原文(4.Experiments 3~4行)，原文描述所使用的模型与《Diffusion Models Beat GANs on Image Synthesis》所用模型一致，
+    但是该文章源码并没有使用这种降采样方式，只是简单的3x3或者avg_pool
+    """
     def __init__(self, in_ch):
         super().__init__()
         self.c1 = nn.Conv2d(in_ch, in_ch, 3, stride=2, padding=1)
@@ -74,10 +93,14 @@ class DownSample(nn.Module):
 
 
 class UpSample(nn.Module):
+    """
+    相比于``Diffusion.Model.UpSample``, 这里的上采样模块使用反卷积而不是最近邻插值
+    同``DownSample``也不明白原因，因该两种方式都可以，看个人喜好。
+    """
     def __init__(self, in_ch):
         super().__init__()
-        self.c = nn.Conv2d(in_ch, in_ch, 3, stride=1, padding=1)
-        self.t = nn.ConvTranspose2d(in_ch, in_ch, 5, 2, 2, 1)
+        self.c = nn.Conv2d(in_ch, in_ch, kernel_size=3, stride=1, padding=1)
+        self.t = nn.ConvTranspose2d(in_ch, in_ch, kernel_size=5, stride=2, padding=2, output_padding=1)
 
     def forward(self, x, temb, cemb):
         _, _, H, W = x.shape
@@ -87,6 +110,9 @@ class UpSample(nn.Module):
 
 
 class AttnBlock(nn.Module):
+    """
+    和``Diffusion.Model``中的``AttnBlock``一模一样
+    """
     def __init__(self, in_ch):
         super().__init__()
         self.group_norm = nn.GroupNorm(32, in_ch)
@@ -117,8 +143,11 @@ class AttnBlock(nn.Module):
         return x + h
 
 
-
 class ResBlock(nn.Module):
+    """
+    相比于``Diffusion.Model.ResBlock``, 这里的残差模块多加了一个条件投射层``self.cond_proj``，
+    在这里其实可以直接把它看作另一个time-embedding, 它们参与训练的方式一模一样
+    """
     def __init__(self, in_ch, out_ch, tdim, dropout, attn=True):
         super().__init__()
         self.block1 = nn.Sequential(
@@ -149,12 +178,11 @@ class ResBlock(nn.Module):
         else:
             self.attn = nn.Identity()
 
-
-    def forward(self, x, temb, labels):
+    def forward(self, x, temb, cemb):
         h = self.block1(x)
-        h += self.temb_proj(temb)[:, :, None, None]
-        h += self.cond_proj(labels)[:, :, None, None]
-        h = self.block2(h)
+        h += self.temb_proj(temb)[:, :, None, None]  # 加上time-embedding
+        h += self.cond_proj(cemb)[:, :, None, None]  # 加上conditional-embedding
+        h = self.block2(h)                           # 特征融合
 
         h = h + self.shortcut(x)
         h = self.attn(h)
@@ -162,6 +190,11 @@ class ResBlock(nn.Module):
 
 
 class UNet(nn.Module):
+    """
+    相比于``Diffusion.Model.UNet``, 这里的UNet模块就多加了一个``cond_embedding``，
+    还有一个变化是在降采样和上采样阶段没有加自注意力层，只在中间过度的时候加了一次，这我不明白是何用意，
+    可能是希望网络不要从自己身上学到太多，多关注condition?(我瞎猜的)
+    """
     def __init__(self, T, num_labels, ch, ch_mult, num_res_blocks, dropout):
         super().__init__()
         tdim = ch * 4
@@ -201,7 +234,6 @@ class UNet(nn.Module):
             Swish(),
             nn.Conv2d(now_ch, 3, 3, stride=1, padding=1)
         )
- 
 
     def forward(self, x, t, labels):
         # Timestep embedding
